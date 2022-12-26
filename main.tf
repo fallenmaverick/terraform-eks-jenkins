@@ -1,106 +1,81 @@
-terraform {
- required_providers {
-  aws = {
-   source = "hashicorp/aws"
+provider "aws" {
+  region = "ap-south-1"
+}
+
+data "aws_availability_zones" "available" {}
+
+data "aws_eks_cluster" "cluster" {
+  name = module.eks.cluster_id
+}
+
+data "aws_eks_cluster_auth" "cluster" {
+  name = module.eks.cluster_id
+}
+
+locals {
+  cluster_name = "myk8s"
+}
+
+provider "kubernetes" {
+  host                   = data.aws_eks_cluster.cluster.endpoint
+  cluster_ca_certificate = base64decode(data.aws_eks_cluster.cluster.certificate_authority.0.data)
+  token                  = data.aws_eks_cluster_auth.cluster.token
+}
+
+module "eks-kubeconfig" {
+  source     = "hyperbadger/eks-kubeconfig/aws"
+  version    = "1.0.0"
+
+  depends_on = [module.eks]
+  cluster_id =  module.eks.cluster_id
   }
- }
+
+resource "local_file" "kubeconfig" {
+  content  = module.eks-kubeconfig.kubeconfig
+  filename = "kubeconfig_${local.cluster_name}"
 }
 
-resource "aws_iam_role" "eks-iam-role" {
- name = "devops-eks-iam-role"
+module "vpc" {
+  source  = "terraform-aws-modules/vpc/aws"
+  version = "3.18.1"
 
- path = "/"
+  name                 = "k8s-vpc"
+  cidr                 = "172.16.0.0/16"
+  azs                  = data.aws_availability_zones.available.names
+  private_subnets      = ["172.16.1.0/24", "172.16.2.0/24", "172.16.3.0/24"]
+  public_subnets       = ["172.16.4.0/24", "172.16.5.0/24", "172.16.6.0/24"]
+  enable_nat_gateway   = true
+  single_nat_gateway   = true
+  enable_dns_hostnames = true
 
- assume_role_policy = <<EOF
-{
- "Version": "2012-10-17",
- "Statement": [
-  {
-   "Effect": "Allow",
-   "Principal": {
-    "Service": "eks.amazonaws.com"
-   },
-   "Action": "sts:AssumeRole"
+  public_subnet_tags = {
+    "kubernetes.io/cluster/${local.cluster_name}" = "shared"
+    "kubernetes.io/role/elb"                      = "1"
   }
- ]
-}
-EOF
 
-}
-
-resource "aws_iam_role_policy_attachment" "AmazonEKSClusterPolicy" {
- policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
- role    = aws_iam_role.eks-iam-role.name
-}
-resource "aws_iam_role_policy_attachment" "AmazonEC2ContainerRegistryReadOnly-EKS" {
- policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
- role    = aws_iam_role.eks-iam-role.name
+  private_subnet_tags = {
+    "kubernetes.io/cluster/${local.cluster_name}" = "shared"
+    "kubernetes.io/role/internal-elb"             = "1"
+  }
 }
 
-resource "aws_eks_cluster" "my-eks" {
- name = var.cluster_name
- role_arn = aws_iam_role.eks-iam-role.arn
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "18.30.3"
 
- vpc_config {
-  subnet_ids = [var.subnet_id_1, var.subnet_id_2]
- }
+  cluster_name    = "${local.cluster_name}"
+  cluster_version = "1.24"
+  subnet_ids      = module.vpc.private_subnets
 
- depends_on = [
-  aws_iam_role.eks-iam-role,
- ]
-}
+  vpc_id = module.vpc.vpc_id
 
-resource "aws_iam_role" "workernodes" {
-  name = "eks-node-group-example"
+  eks_managed_node_groups = {
+    first = {
+      desired_capacity = 1
+      max_capacity     = 10
+      min_capacity     = 1
 
-  assume_role_policy = jsonencode({
-   Statement = [{
-    Action = "sts:AssumeRole"
-    Effect = "Allow"
-    Principal = {
-     Service = "ec2.amazonaws.com"
+      instance_type = "t2.medium"
     }
-   }]
-   Version = "2012-10-17"
-  })
- }
-
- resource "aws_iam_role_policy_attachment" "AmazonEKSWorkerNodePolicy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
-  role    = aws_iam_role.workernodes.name
- }
-
- resource "aws_iam_role_policy_attachment" "AmazonEKS_CNI_Policy" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
-  role    = aws_iam_role.workernodes.name
- }
-
- resource "aws_iam_role_policy_attachment" "EC2InstanceProfileForImageBuilderECRContainerBuilds" {
-  policy_arn = "arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilderECRContainerBuilds"
-  role    = aws_iam_role.workernodes.name
- }
-
- resource "aws_iam_role_policy_attachment" "AmazonEC2ContainerRegistryReadOnly" {
-  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
-  role    = aws_iam_role.workernodes.name
- }
-
- resource "aws_eks_node_group" "worker-node-group" {
-  cluster_name  = aws_eks_cluster.my-eks.name
-  node_group_name = "my-workernodes"
-  node_role_arn  = aws_iam_role.workernodes.arn
-  subnet_ids   = [var.subnet_id_1, var.subnet_id_2]
-  instance_types = ["t2.medium"]
-
-  scaling_config {
-   desired_size = 2
-   max_size   = 2
-   min_size   = 1
   }
-
-  depends_on = [
-   aws_iam_role_policy_attachment.AmazonEKSWorkerNodePolicy,
-   aws_iam_role_policy_attachment.AmazonEKS_CNI_Policy,
-   aws_iam_role_policy_attachment.AmazonEC2ContainerRegistryReadOnly,
-  ]
- }
+}
